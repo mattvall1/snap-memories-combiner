@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import os
 import re
-import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -98,43 +98,50 @@ def combine_image(base_path: Path, overlay_path: Path, output_path: Path):
 
 def combine_video(base_path: Path, overlay_path: Path, output_path: Path):
     """Combine base video with overlay using ffmpeg."""
-    input_video = ffmpeg.input(str(base_path))
-    input_overlay = ffmpeg.input(str(overlay_path))
 
-    # Get video info to scale overlay to match
-    probe = ffmpeg.probe(str(base_path))
-    video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
-    width = int(video_info['width'])
-    height = int(video_info['height'])
+    # Snapchat saves overlays as WebP with a .png extension.
+    # FFmpeg detects the true WebP format but may fail to decode it,
+    # so we convert it to a real PNG first using Pillow.
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        tmp_overlay_path = Path(tmp.name)
+    try:
+        Image.open(overlay_path).convert("RGBA").save(tmp_overlay_path, format='PNG')
 
-    # Scale overlay to match video dimensions, then overlay at 0,0
-    scaled_overlay = ffmpeg.filter(input_overlay, 'scale', width, height)
-    video_output = ffmpeg.filter([input_video, scaled_overlay], 'overlay', x='0', y='0')
-    
-    # Check if video has audio stream
-    has_audio = any(s['codec_type'] == 'audio' for s in probe['streams'])
+        input_video = ffmpeg.input(str(base_path))
+        input_overlay = ffmpeg.input(str(tmp_overlay_path))
 
-    if has_audio:
-        audio_output = input_video.audio
-        output = ffmpeg.output(video_output, audio_output, str(output_path),
-                              vcodec='libx264', acodec='copy', pix_fmt='yuv420p',
-                              **{'map_metadata': 0})
-    else:
-        output = ffmpeg.output(video_output, str(output_path),
-                              vcodec='libx264', pix_fmt='yuv420p',
-                              **{'map_metadata': 0})
+        # Get video info to scale overlay to match
+        probe = ffmpeg.probe(str(base_path))
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        width = int(video_info['width'])
+        height = int(video_info['height'])
 
-    # Run ffmpeg
-    ffmpeg.run(output, overwrite_output=True)
+        # Scale overlay to match video dimensions, then overlay at 0,0
+        scaled_overlay = ffmpeg.filter(input_overlay, 'scale', width, height)
+        video_output = ffmpeg.filter([input_video, scaled_overlay], 'overlay', x='0', y='0')
 
-    # Copy file timestamps from original
-    stat = os.stat(base_path)
-    os.utime(output_path, (stat.st_atime, stat.st_mtime))
+        # Check if video has audio stream
+        has_audio = any(s['codec_type'] == 'audio' for s in probe['streams'])
+
+        if has_audio:
+            audio_output = input_video.audio
+            output = ffmpeg.output(video_output, audio_output, str(output_path),
+                                  vcodec='libx265', acodec='copy', pix_fmt='yuv420p',
+                                  crf=18,
+                                  **{'map_metadata': 0})
+        else:
+            output = ffmpeg.output(video_output, str(output_path),
+                                  vcodec='libx265', pix_fmt='yuv420p',
+                                  crf=18,
+                                  **{'map_metadata': 0})
+
+        # Run ffmpeg
+        ffmpeg.run(output, overwrite_output=True)
+    finally:
+        tmp_overlay_path.unlink(missing_ok=True)
 
 
 def main():
-    include_bases = "--include-bases" in sys.argv
-
     print("Snapchat Memories Batch Combiner")
     print("="*60)
 
@@ -150,14 +157,6 @@ def main():
     for i, pair in enumerate(pairs, 1):
         print(f"[{i}/{len(pairs)}] Processing: {pair.base_path.name}")
 
-        has_overlay = pair.overlay_path is not None
-
-        # Copy base to out directory (copy2 preserves timestamps)
-        if (has_overlay and include_bases) or not has_overlay:
-            base_copy = OUTPUT_DIR / pair.base_path.name
-            shutil.copy2(pair.base_path, base_copy)
-            print(f"  → Base saved: {base_copy.name}")
-
         # Combine with overlay if present
         if pair.overlay_path:
             combined_name = pair.base_path.name.replace('-main', '-combined')
@@ -170,7 +169,7 @@ def main():
 
             print(f"  → Combined: {combined_path.name}")
         else:
-            print("  → No overlay found, skipped combination")
+            print("  → No overlay found, skipped")
 
         print()
 

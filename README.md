@@ -16,5 +16,3 @@ Move all of the images and videos into a single `memories/` folder in the same d
 Open a terminal in the same directory and run the script with `uv run main.py`. (If you don't have uv, install it from [here](https://docs.astral.sh/uv/getting-started/installation/))
 
 All output files will be placed in an `out/` folder. Base files that have no overlays will just be copied over. File with overlays will be combined with their respective overlays and the combined version will be placed in `out/`.
-
-You can specify the `--include-bases` flag to also copy the uncombined bases to `out/`.
