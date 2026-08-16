@@ -20,3 +20,5 @@ out/
 *.zip
 
 .DS_Store
+
+.idea
