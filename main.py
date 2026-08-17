@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -116,6 +118,18 @@ def combine_video(base_path: Path, overlay_path: Path, output_path: Path):
         width = int(video_info['width'])
         height = int(video_info['height'])
 
+        # Phones often record with the sensor in landscape and store a rotation
+        # in a Display Matrix side data entry to display it upright. FFmpeg
+        # auto-applies that rotation while filtering, so the frame the overlay
+        # filter actually sees is width/height swapped from the raw stream info.
+        rotation = next(
+            (sd.get('rotation', 0) for sd in video_info.get('side_data_list', [])
+             if sd.get('side_data_type') == 'Display Matrix'),
+            0,
+        )
+        if abs(rotation) % 180 == 90:
+            width, height = height, width
+
         # Scale overlay to match video dimensions, then overlay at 0,0
         scaled_overlay = ffmpeg.filter(input_overlay, 'scale', width, height)
         video_output = ffmpeg.filter([input_video, scaled_overlay], 'overlay', x='0', y='0')
@@ -123,25 +137,52 @@ def combine_video(base_path: Path, overlay_path: Path, output_path: Path):
         # Check if video has audio stream
         has_audio = any(s['codec_type'] == 'audio' for s in probe['streams'])
 
+        # ffmpeg tags libx265 output as 'hev1' by default, which QuickTime/Apple
+        # Photos refuses to play. Apple's decoders only recognize HEVC-in-MP4
+        # tagged as 'hvc1'.
+        creation_time = probe['format'].get('tags', {}).get('creation_time')
+        metadata_kwargs = {'map_metadata': 0}
+        if creation_time:
+            # Snap exports (often Android-sourced) only carry the generic
+            # 'creation_time' atom. Apple Photos' date importer prefers its
+            # own 'com.apple.quicktime.creationdate' key and otherwise falls
+            # back to the file's filesystem timestamp, so set both.
+            metadata_kwargs['metadata:g'] = f'com.apple.quicktime.creationdate={creation_time}'
+
         if has_audio:
             audio_output = input_video.audio
             output = ffmpeg.output(video_output, audio_output, str(output_path),
                                   vcodec='libx265', acodec='copy', pix_fmt='yuv420p',
-                                  crf=18,
-                                  **{'map_metadata': 0})
+                                  crf=18, vtag='hvc1',
+                                  **metadata_kwargs)
         else:
             output = ffmpeg.output(video_output, str(output_path),
                                   vcodec='libx265', pix_fmt='yuv420p',
-                                  crf=18,
-                                  **{'map_metadata': 0})
+                                  crf=18, vtag='hvc1',
+                                  **metadata_kwargs)
 
         # Run ffmpeg
         ffmpeg.run(output, overwrite_output=True)
+
+        # Copy file timestamps from original, so tools that ignore embedded
+        # metadata (e.g. Apple Photos when it can't parse it) still see the
+        # correct date.
+        stat = os.stat(base_path)
+        os.utime(output_path, (stat.st_atime, stat.st_mtime))
     finally:
         tmp_overlay_path.unlink(missing_ok=True)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Snapchat Memories Batch Combiner")
+    parser.add_argument('--check-previous', action='store_true',
+                         help="Skip files that already have a combined output in the out/ directory")
+    parser.add_argument('--include-bases', action='store_true',
+                         help="Copy base files that have no overlay into the out/ directory instead of skipping them")
+    parser.add_argument('--videos-only', action='store_true',
+                         help="Only process video files, skipping images")
+    args = parser.parse_args()
+
     print("Snapchat Memories Batch Combiner")
     print("="*60)
 
@@ -151,6 +192,10 @@ def main():
     # Scan for memory pairs
     print("Scanning memories directory...")
     pairs = scan_memories()
+
+    if args.videos_only:
+        pairs = [pair for pair in pairs if pair.is_video]
+
     print(f"Found {len(pairs)} memory files\n")
 
     # Process all pairs
@@ -162,12 +207,27 @@ def main():
             combined_name = pair.base_path.name.replace('-main', '-combined')
             combined_path = OUTPUT_DIR / combined_name
 
+            if args.check_previous and combined_path.exists():
+                print(f"  → Already processed, skipped")
+                print()
+                continue
+
             if pair.is_video:
                 combine_video(pair.base_path, pair.overlay_path, combined_path)
             else:
                 combine_image(pair.base_path, pair.overlay_path, combined_path)
 
             print(f"  → Combined: {combined_path.name}")
+        elif args.include_bases:
+            base_output_path = OUTPUT_DIR / pair.base_path.name
+
+            if args.check_previous and base_output_path.exists():
+                print(f"  → Already processed, skipped")
+                print()
+                continue
+
+            shutil.copy2(pair.base_path, base_output_path)
+            print(f"  → Copied: {base_output_path.name}")
         else:
             print("  → No overlay found, skipped")
 
